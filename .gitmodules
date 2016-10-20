@@ -1,0 +1,3 @@
+[submodule "ESP8266_SPI_Driver"]
+	path = ESP8266_SPI_Driver
+	url = https://github.com/MetalPhreak/ESP8266_SPI_Driver
