@@ -21,6 +21,11 @@ TODO
  * Move any framework specific code to separate headers
  * Port & test on esp8266-arduino
  * Port & test on Sming
+ * Check latency (70ms?!)
+ * Make it a little bit more stable
+ * Support for hardware RESET
+ * Does not work when wifi mode is set to `NULL_MODE`
+
 
 License
 -------
