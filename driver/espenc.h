@@ -8,6 +8,8 @@ void espenc_init();
 
 #define log(s, ...) os_printf ("[%s:%s:%d] " s "\n", __FILE__, __FUNCTION__, __LINE__, ##__VA_ARGS__)
 
+#define ESP_CS 15
+#define ESP_INT 5
 
 
 // ENC28J60 Control Registers

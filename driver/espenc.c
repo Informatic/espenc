@@ -4,12 +4,16 @@
 #include "gpio.h"
 #include "mem.h"
 
+struct netif enc_netif;
+ip_addr_t ipaddr;
+
 static uint8_t Enc28j60Bank;
+static uint16_t NextPacketPtr;
 
 void chipEnable() {
-    // Force CS pin low
+    // Force CS pin low (FIXME)
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDO_U, FUNC_GPIO15);
-    GPIO_OUTPUT_SET(15, 0);
+    GPIO_OUTPUT_SET(ESP_CS, 0);
 }
 
 void chipDisable() {
@@ -72,6 +76,24 @@ static void writePhy (uint8_t address, uint16_t data) {
         ;
 }
 
+static void readBuf(uint16_t len, uint8_t* data) {
+    // force CS pin here, as it requires multiple bytes to be sent
+    log("readBuf()");
+    chipEnable();
+    if (len != 0) {
+        spi_transaction(HSPI, 8, ENC28J60_READ_BUF_MEM, 0, 0, 0, 0, 0, 0);
+        while (len--) {
+            uint8_t nextbyte;
+
+            while(spi_busy(HSPI));	//wait for SPI transaction to complete
+            nextbyte = spi_transaction(HSPI, 0, 0, 0, 0, 0, 0, 8, 0);
+            *data++ = nextbyte;
+     	};
+        while(spi_busy(HSPI));	//wait for SPI transaction to complete
+    }
+    chipDisable();
+}
+
 static void writeBuf(uint16_t len, const uint8_t* data) {
     // force CS pin here, as it requires multiple bytes to be sent
     chipEnable();
@@ -88,50 +110,174 @@ static void writeBuf(uint16_t len, const uint8_t* data) {
     chipDisable();
 }
 
+uint8_t enc28j60_int_disable() {
+    uint8_t interrupts = 0;
+    SetBank(EIE);
+    interrupts = readRegByte(EIE);
+    writeOp(ENC28J60_BIT_FIELD_CLR, EIE, interrupts);
+    return interrupts;
+}
+
+void enc28j60_int_enable(uint8_t interrupts) {
+    SetBank(EIE);
+    writeOp(ENC28J60_BIT_FIELD_SET, EIE, interrupts);
+}
+
 err_t enc28j60_link_output(struct netif *netif, struct pbuf *p) {
     uint8_t retry = 0;
     uint16_t len = p->tot_len;
+
+    uint8_t interrupts = enc28j60_int_disable();
+
     log("output, tot_len: %d", p->tot_len);
     uint8_t isUp = (readPhyByte(PHSTAT2) >> 2) & 1;
     log("link is up: %d", isUp);
+    log("pktcnt: %d", readRegByte(EPKTCNT));
 
+    SetBank(ECON1);
     writeOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRST);
     writeOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRST);
+    SetBank(EIR);
     writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF|EIR_TXIF);
 
     if(retry == 0) {
         writeReg(EWRPT, TXSTART_INIT);
         writeReg(ETXND, TXSTART_INIT+len);
-        writeOp(ENC28J60_WRITE_BUF_MEM, 0, 0x00);
+        //writeOp(ENC28J60_WRITE_BUF_MEM, 0, 0x00);
         uint8_t* buffer = (uint8_t*) os_malloc(len);
-        log("buf: %d", buffer);
         pbuf_copy_partial(p, buffer, p->tot_len, 0);
-        int i = 0;
-        for(i = 0; i < 16; i++) {
-            log("%02x", buffer[i]);
-        }
         writeBuf(len, buffer);
         os_free(buffer);
     }
 
+    SetBank(EIR);
+    writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF|EIR_TXIF);
+    log("before transmission: %02x", readRegByte(EIR));
+    SetBank(ECON1);
     writeOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRTS);
 
     uint16_t count = 0;
-    while ((readRegByte(EIR) & (EIR_TXIF | EIR_TXERIF)) == 0 && ++count < 1000U)
+    uint16_t eir = 0;
+    while (((eir = readRegByte(EIR)) & (EIR_TXIF | EIR_TXERIF)) == 0 && ++count < 1000U)
         ;
 
-    if (!(readRegByte(EIR) & EIR_TXERIF) && count < 1000U) {
+    if (!(eir & EIR_TXERIF) && count < 1000U) {
         // no error; start new transmission
         log("transmission success");
     } else {
-        log("transmission failed");
+        log("transmission failed (%d - %02x)", count, eir);
     }
 
+    SetBank(ECON1);
     writeOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRTS);
+
+    enc28j60_int_enable(interrupts);
+}
+
+static uint32_t interrupt_reg = 0;
+
+void enc28j60_handle_packets(void) {
+    log("reading ptr: %04x", NextPacketPtr);
+    writeReg(ERDPT, NextPacketPtr);
+    uint16_t packetLen = 0;
+    uint16_t rxStatus = 0;
+
+    readBuf(2, (uint8_t*) &NextPacketPtr);
+    readBuf(2, (uint8_t*) &packetLen);
+    readBuf(2, (uint8_t*) &rxStatus);
+
+    // Ignore packet checksum TODO
+    packetLen -= 4;
+
+    log("next ptr: %04x", NextPacketPtr);
+    log("packet len: %d (%x)", packetLen, packetLen);
+    log("rx status: %02x", rxStatus);
+
+    if(rxStatus & 0x80 == 0) {
+        log("RECEIVE FAILED");
+    } else {
+        uint16_t len = packetLen;
+        struct pbuf* p = pbuf_alloc(PBUF_LINK, len, PBUF_RAM);
+        if(p != 0) {
+            uint8_t* data;
+            struct pbuf* q;
+
+            for(q = p; q != 0; q= q->next) {
+                data = q->payload;
+                len = q->len;
+
+                log("reading %d to %x", len, data);
+                readBuf(len, data);
+            }
+
+            log("packet received, passing to netif->input");
+            enc_netif.input(p, &enc_netif);
+        } else {
+            log("pbuf_alloc failed!");
+        }
+    }
+
+    SetBank(ECON2);
+    writeOp(ENC28J60_BIT_FIELD_SET, ECON2, ECON2_PKTDEC);
+
+    writeReg(ERXRDPT, NextPacketPtr);
+}
+
+void interrupt_handler(void *arg) {
+    ETS_GPIO_INTR_DISABLE();
+    GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, GPIO_REG_READ(GPIO_STATUS_ADDRESS));
+
+    uint8_t interrupt = readRegByte(EIR);
+    uint8_t pktCnt = readRegByte(EPKTCNT);
+
+    log(" *** INTERRUPT (%02X / %d) ***", interrupt, pktCnt);
+
+    if(pktCnt > 0) {
+        log("pktCnt > 0");
+
+        while(readRegByte(EPKTCNT) > 0)
+            enc28j60_handle_packets();
+
+        //SetBank(EIE);
+        //writeOp(ENC28J60_BIT_FIELD_CLR, EIE, EIE_PKTIE);
+    }
+
+    if(interrupt & EIR_PKTIF) {
+        log("PKTIF interrupt");
+        SetBank(EIR);
+        writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_PKTIF);
+    }
+
+    if(interrupt & EIR_TXIF) {
+        log("TXIF interrupt");
+
+        SetBank(EIR);
+        writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXIF);
+    }
+
+    if(interrupt & EIR_TXERIF) {
+        log("TXERIF int");
+        SetBank(EIR);
+        writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_TXERIF);
+    }
+
+    ETS_GPIO_INTR_ENABLE();
 }
 
 // http://lwip.wikia.com/wiki/Writing_a_device_driver
 err_t enc28j60_init(struct netif *netif) {
+    ETS_GPIO_INTR_ATTACH(interrupt_handler, &interrupt_reg);
+    ETS_GPIO_INTR_ENABLE();
+
+    gpio_register_set(GPIO_PIN_ADDR(ESP_INT), GPIO_PIN_INT_TYPE_SET(GPIO_PIN_INTR_DISABLE)
+            | GPIO_PIN_PAD_DRIVER_SET(GPIO_PAD_DRIVER_DISABLE)
+            | GPIO_PIN_SOURCE_SET(GPIO_AS_PIN_SOURCE));
+
+    GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, 1 << ESP_INT);
+    gpio_pin_intr_state_set(GPIO_ID_PIN(ESP_INT), GPIO_PIN_INTR_NEGEDGE);
+
+    log("interrupts enabled");
+
     log("initializing");
     netif->linkoutput = enc28j60_link_output;
     netif->name[0] = 'e';
@@ -158,7 +304,7 @@ err_t enc28j60_init(struct netif *netif) {
         log("estat: %02x", estat);
         os_delay_us(2000); // errata B7/2
     }
-
+    NextPacketPtr = RXSTART_INIT;
     writeReg(ERXST, RXSTART_INIT);
     writeReg(ERXRDPT, RXSTART_INIT);
     writeReg(ERXND, RXSTOP_INIT);
@@ -182,8 +328,13 @@ err_t enc28j60_init(struct netif *netif) {
     writeRegByte(MAADR1, netif->hwaddr[4]);
     writeRegByte(MAADR0, netif->hwaddr[5]);
     writePhy(PHCON2, PHCON2_HDLDIS);
-    SetBank(ECON1);
+    SetBank(EIE);
     writeOp(ENC28J60_BIT_FIELD_SET, EIE, EIE_INTIE|EIE_PKTIE);
+
+    SetBank(EIR);
+    writeOp(ENC28J60_BIT_FIELD_CLR, EIR, EIR_PKTIF);
+
+    SetBank(ECON1);
     writeOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_RXEN);
 
     uint8_t rev = readRegByte(EREVID);
@@ -193,13 +344,12 @@ err_t enc28j60_init(struct netif *netif) {
     // there is no B8 out yet
     if (rev > 5) ++rev;
     log("hardware ready, rev: %d", rev);
+
     return ERR_OK;
 }
 
-struct netif enc_netif;
-ip_addr_t ipaddr;
-
 void espenc_init() {
+
     IP4_ADDR(&ipaddr, 0, 0, 0, 0);
 
     struct netif* new_netif = netif_add(&enc_netif, &ipaddr, &ipaddr, &ipaddr, NULL, enc28j60_init,
